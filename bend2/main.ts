@@ -304,6 +304,23 @@ function cli_emit(book: Bend.Book, out: string): void {
 // clang 19 (Apple clang 17, which ships LLVM 19), whose #embed
 // carries the device program.
 function cc_find(gpu: boolean): string {
+  if (process.platform === "win32") {
+    const candidates = [
+      process.env.CC,
+      "clang",
+      "gcc",
+      "C:\\msys64\\ucrt64\\bin\\gcc.exe",
+      "C:\\msys64\\mingw64\\bin\\gcc.exe"
+    ].filter(Boolean) as string[];
+    for (const cc of candidates) {
+      try {
+        const out = child.spawnSync(cc, ["--version"], { encoding: "utf8" }).stdout ?? "";
+        if (out.length > 0) {
+          return cc;
+        }
+      } catch {}
+    }
+  }
   function dir_list(dir: string): string[] {
     try {
       return fs.readdirSync(dir);
@@ -342,21 +359,23 @@ function cc_find(gpu: boolean): string {
 function cli_build(bin: string, file: string): void {
   const c     = fs.readFileSync(file, "utf8");
   const mac   = process.platform === "darwin";
+  const win   = process.platform === "win32";
   const cuda  = process.env.CUDA_HOME || "/usr/local/cuda";
   const bangs = !/^#define BANGS\s+0$/m.test(c)
     && (mac || fs.existsSync(cuda + "/include/nvrtc.h"));
   const cc    = cc_find(bangs);
   const objc  = mac && (bangs || /^#import /m.test(c))
     ? ["-x", "objective-c", "-fobjc-arc", "-fmodules"] : [];
-  const libs  = [["X11", "X11"], ["alsa", "asound"]].flatMap(([h, l]) =>
+  const libs  = win ? ["-lws2_32"] : [["X11", "X11"], ["alsa", "asound"]].flatMap(([h, l]) =>
     !mac && c.includes("#include <" + h + "/") ? ["-l" + l] : []);
+  const outPath = win && !bin.endsWith(".exe") ? path.resolve(bin + ".exe") : path.resolve(bin);
   const cpu = [...objc, "-std=c11", "-O3", file, "-lpthread", "-lm",
-    ...libs, "-o", path.resolve(bin)];
+    ...libs, "-o", outPath];
   const gpu = mac ? ["-DBEND_METAL=1", ...cpu]
     : ["-DBEND_CUDA=1", "-I" + cuda + "/include", "-L" + cuda + "/lib64",
       "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
   const steps: [string, string[]][] = bangs
-    ? [[cc, gpu], [path.resolve(bin), ["--gpu-build"]]] : [[cc, cpu]];
+    ? [[cc, gpu], [outPath, ["--gpu-build"]]] : [[cc, cpu]];
   for (const [cmd, args] of steps) {
     if (child.spawnSync(cmd, args, { stdio: "inherit" }).status !== 0) {
       throw "Error: " + path.basename(cmd) + " failed to build " + bin;

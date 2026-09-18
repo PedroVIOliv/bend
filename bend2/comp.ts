@@ -3183,9 +3183,15 @@ using namespace metal;
 #include <stdatomic.h>
 #include <unistd.h>
 #include <signal.h>
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <time.h>
 #include <poll.h>
+#else
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <time.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -3264,6 +3270,7 @@ using namespace metal;
 #define CLZ(x)  (u32)__builtin_clz(x)
 #endif
 #endif
+#undef FAR
 #define FAR static __attribute__((noinline))
 
 // A segment: a case of the device's switch; on the host, a preserve_none
@@ -3281,8 +3288,13 @@ using namespace metal;
 #define WL_FN      static PRESERVE(preserve_none) __attribute__((noinline)) Reply
 #define WL_CASE(F) WL_FN WL_##F(WL_SIG)
 #define WL_OPEN    { WL_BANK u32 rn;
+#ifdef __clang__
 #define WL_JMP(F)  __attribute__((musttail)) return WL_##F(WL_ALL)
 #define WL_DYN(F)  __attribute__((musttail)) return wl_tab[F](WL_ALL)
+#else
+#define WL_JMP(F)  return WL_##F(WL_ALL)
+#define WL_DYN(F)  return wl_tab[F](WL_ALL)
+#endif
 #endif
 #define WL_SPIN     for (;;) { if (err_spun(e.mem, &wpoll)) { return 0; }
 #define WL_SPUN     } break;
@@ -4628,6 +4640,65 @@ static void row_grow(Env e, Stk stk, u32 base, u32 stride, u32 want) {
 // Pool
 // ====
 
+#ifdef _WIN32
+#define MAP_FAILED NULL
+
+static LONG WINAPI win_mem_fault_handler(PEXCEPTION_POINTERS ep) {
+  if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+    ULONG_PTR fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
+    ULONG_PTR chunk_base = fault_addr & ~((1ull << 21) - 1);
+    if (VirtualAlloc((void*)chunk_base, 1ull << 21, MEM_COMMIT, PAGE_READWRITE) != NULL) {
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void win_init_veh(void) {
+  static bool done = false;
+  if (!done) {
+    AddVectoredExceptionHandler(1, win_mem_fault_handler);
+    done = true;
+  }
+}
+
+static void* pool_try(u64 bytes) {
+  win_init_veh();
+  void* p = VirtualAlloc(NULL, bytes, MEM_RESERVE, PAGE_NOACCESS);
+  if (p == NULL) {
+    return NULL;
+  }
+  u64 init_commit = bytes < (64ull << 20) ? bytes : (64ull << 20);
+  if (!VirtualAlloc(p, init_commit, MEM_COMMIT, PAGE_READWRITE)) {
+    VirtualFree(p, 0, MEM_RELEASE);
+    return NULL;
+  }
+  return p;
+}
+
+static void* pool_mmap(u64 bytes) {
+  void* p = pool_try(bytes);
+  if (p == NULL) {
+    err_fail("reservation failed");
+  }
+  return p;
+}
+
+static Term* pool_stack(void) {
+  win_init_veh();
+  u64 len = 1ull << 31;
+  char* p = (char*)VirtualAlloc(NULL, len, MEM_RESERVE, PAGE_NOACCESS);
+  if (p == NULL) {
+    len = 64ull << 20;
+    p = (char*)VirtualAlloc(NULL, len, MEM_RESERVE, PAGE_NOACCESS);
+  }
+  if (p == NULL) {
+    err_fail("stack reservation failed");
+  }
+  VirtualAlloc(p, 4ull << 20, MEM_COMMIT, PAGE_READWRITE);
+  return (Term*)p;
+}
+#else
 static void* pool_try(u64 bytes) {
   return mmap(NULL, bytes, PROT_READ | PROT_WRITE,
     MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
@@ -4654,6 +4725,7 @@ static Term* pool_stack(void) {
   sigaction(SIGBUS, &sa, NULL);
   return (Term*)p;
 }
+#endif
 
 static void* pool_work(void* arg) {
   Term* stk  = pool_stack();
@@ -4716,6 +4788,13 @@ static int cpu_read(const char* path, long* a, long* b) {
   return n;
 }
 
+#ifdef _WIN32
+static long cpu_count(void) {
+  SYSTEM_INFO sysinfo;
+  GetSystemInfo(&sysinfo);
+  return sysinfo.dwNumberOfProcessors;
+}
+#else
 static long cpu_count(void) {
   long n = sysconf(_SC_NPROCESSORS_ONLN);
 #ifdef __linux__
@@ -4735,6 +4814,7 @@ static long cpu_count(void) {
 #endif
   return n;
 }
+#endif
 
 OUTLINE void pool_turn(bool grow) {
   pool_grow = grow;
@@ -4762,7 +4842,9 @@ OUTLINE void pool_turn(bool grow) {
 static const char* gpu_path(void) {
   static char path[4096];
   u32 n = sizeof path - 8;
-#ifdef __APPLE__
+#ifdef _WIN32
+  GetModuleFileNameA(NULL, path, n);
+#elif defined(__APPLE__)
   _NSGetExecutablePath(path, &n);
 #else
   path[readlink("/proc/self/exe", path, n)] = 0;
@@ -5164,11 +5246,20 @@ OUTLINE Term corpus_eval(Corpus H, Term t) {
 // Io
 // ==
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <errno.h>
+#include <fcntl.h>
+#define poll WSAPoll
+#define SIGPIPE 0
+#else
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 
 #define IO_READ 1
 #define IO_TIME 2
@@ -5733,10 +5824,22 @@ static int io_step(Env e, IoAct* a) {
 OUTLINE int io_loop(Corpus H) {
   Env e = { H, ALC[0] };
   io_stk = pool_stack();
+#ifdef _WIN32
+  static bool wsa_init = false;
+  if (!wsa_init) {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    wsa_init = true;
+  }
+  if (_pipe(io_wake_fd, 512, _O_BINARY) != 0) {
+    err_fail("the event loop failed to open");
+  }
+#else
   signal(SIGPIPE, SIG_IGN);
   if (pipe(io_wake_fd) | fcntl(io_wake_fd[0], F_SETFL, O_NONBLOCK)) {
     err_fail("the event loop failed to open");
   }
+#endif
   Term m = corpus_eval(H, term_tsk(MAIN_FID, task_node(e, MAIN_FID,
     TERM_HOLE, 0, 0)));
 #if MAIN_PURE
