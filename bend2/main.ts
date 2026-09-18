@@ -279,7 +279,7 @@ async function cli_checkup(file: string): Promise<void> {
 }
 
 function path_real(p: string): string {
-  return fs.existsSync(p) ? fs.realpathSync(p) : path.resolve(p);
+  return (fs.existsSync(p) ? fs.realpathSync(p) : path.resolve(p)).replace(/\\/g, "/");
 }
 
 function cli_emit(book: Bend.Book, out: string): void {
