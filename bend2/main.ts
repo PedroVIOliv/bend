@@ -301,10 +301,38 @@ function cli_emit(book: Bend.Book, out: string): void {
 }
 
 // cc_find is the first of $CC, clang and every clang-NN on PATH (newest
-// first) that is new enough: clang 14 for a CPU build, and for a GPU build
-// clang 19 (Apple clang 17, which ships LLVM 19), whose #embed
-// carries the device program.
-function cc_find(gpu: boolean): string {
+// Probes for Vulkan support: requires glslangValidator compiler and Vulkan loader
+function vk_probe(): boolean {
+  if (process.env.BEND_VULKAN === "0") return false;
+  const glslang = process.env.GLSLANG || "glslangValidator";
+  try {
+    const res = child.spawnSync(glslang, ["--version"]);
+    if (res.status !== 0) return false;
+  } catch {
+    return false;
+  }
+  if (process.platform === "win32") {
+    const sys32 = process.env.SystemRoot
+      ? path.join(process.env.SystemRoot, "System32", "vulkan-1.dll")
+      : "C:\\Windows\\System32\\vulkan-1.dll";
+    return fs.existsSync(sys32);
+  }
+  if (process.platform === "linux") {
+    const paths = [
+      "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+      "/usr/lib64/libvulkan.so.1",
+      "/usr/lib/libvulkan.so.1",
+      "/usr/local/lib/libvulkan.so.1"
+    ];
+    return paths.some((p) => fs.existsSync(p));
+  }
+  return false;
+}
+
+// cc_find returns the path to a C compiler (the CC environment variable
+// first) that is new enough: clang 14 for a CPU or Vulkan build, and for a GPU build
+// requiring #embed (Metal, CUDA) clang 19 (Apple clang 17, which ships LLVM 19).
+function cc_find(embed: boolean): string {
   if (process.platform === "win32") {
     const candidates = [
       process.env.CC,
@@ -337,15 +365,15 @@ function cc_find(gpu: boolean): string {
   for (const cc of ccs) {
     const out = child.spawnSync(cc, ["--version"], { encoding: "utf8" }).stdout ?? "";
     const m   = /^(Apple )?(?:\w+ )?clang version (\d+)/m.exec(out);
-    const need = gpu ? (m?.[1] === undefined ? 19 : 17) : 14;
+    const need = embed ? (m?.[1] === undefined ? 19 : 17) : 14;
     if (m !== null && Number(m[2]) >= need) {
       return cc;
     }
     olds.push(m !== null ? "clang " + m[2] + " as " + cc
       : out ? cc + ", which is not clang" : "no " + cc);
   }
-  throw "Error: bend needs clang " + (gpu ? "19 (Apple clang 17)" : "14")
-    + " or newer to build " + (gpu ? "a GPU program" : "binaries") + " (found "
+  throw "Error: bend needs clang " + (embed ? "19 (Apple clang 17)" : "14")
+    + " or newer to build " + (embed ? "a GPU program" : "binaries") + " (found "
     + olds.join(", ") + "); on Debian/Ubuntu: curl -fsSL"
     + " https://apt.llvm.org/llvm.sh | sudo bash -s 19; on macOS: xcode-select"
     + " --install";
@@ -363,10 +391,11 @@ function cli_build(bin: string, file: string, book?: Bend.Book): void {
   const win   = process.platform === "win32";
   const cuda  = process.env.CUDA_HOME || "/usr/local/cuda";
   const hasCuda = fs.existsSync(cuda + "/include/nvrtc.h");
-  const vk    = !mac && !hasCuda;
+  const vk    = !mac && !hasCuda && vk_probe();
   const bangs = !/^#define BANGS\s+0$/m.test(c)
     && (mac || hasCuda || vk);
-  const cc    = cc_find(bangs);
+  const needEmbed = bangs && !vk;
+  const cc    = cc_find(needEmbed);
   const objc  = mac && (bangs || /^#import /m.test(c))
     ? ["-x", "objective-c", "-fobjc-arc", "-fmodules"] : [];
   const libs  = win ? ["-lws2_32"] : [["X11", "X11"], ["alsa", "asound"]].flatMap(([h, l]) =>
@@ -384,15 +413,21 @@ function cli_build(bin: string, file: string, book?: Bend.Book): void {
 
   if (bangs && vk) {
     const compSrc = book ? generateVulkanShader(book) : generateVulkanShader(c);
-    const compFile = path.resolve(bin + ".comp");
-    const spvFile = path.resolve(bin + ".gpu");
+    const compFile = outPath + ".comp";
+    const spvFile = outPath + ".gpu";
     fs.writeFileSync(compFile, compSrc);
-    const glslang = process.env.GLSLANG || "glslangValidator";
-    const res = child.spawnSync(glslang, ["-V", "--target-env", "vulkan1.3", "-o", spvFile, compFile], { stdio: "pipe" });
-    if (res.status !== 0) {
-      if (res.stdout) process.stdout.write(res.stdout);
-      if (res.stderr) process.stderr.write(res.stderr);
-      throw "Error: glslangValidator failed to compile " + compFile;
+    try {
+      const glslang = process.env.GLSLANG || "glslangValidator";
+      const res = child.spawnSync(glslang, ["-V", "--target-env", "vulkan1.3", "-o", spvFile, compFile], { stdio: "pipe" });
+      if (res.status !== 0) {
+        if (res.stdout) process.stdout.write(res.stdout);
+        if (res.stderr) process.stderr.write(res.stderr);
+        throw "Error: glslangValidator failed to compile " + compFile;
+      }
+    } finally {
+      if (fs.existsSync(compFile)) {
+        try { fs.unlinkSync(compFile); } catch {}
+      }
     }
   }
 

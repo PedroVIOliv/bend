@@ -85,7 +85,10 @@ const TTOK_BIN = (() => {
 
 function ttok(file: string): number {
   const got = child.spawnSync(TTOK_BIN, [], { input: fs.readFileSync(file) });
-  return Number(got.stdout ? got.stdout.toString().trim() : 0);
+  if (got.status !== 0 || !got.stdout) {
+    throw new Error("ttok failed for " + file + ": " + (got.error?.message ?? got.stderr?.toString() ?? "missing stdout"));
+  }
+  return Number(got.stdout.toString().trim());
 }
 
 function gate(): string[] {
