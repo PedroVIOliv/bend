@@ -1565,7 +1565,7 @@ function seg_fid(k: Bend.Name): string {
 
 // A segment's entry: its frame popped, its parameters read from the
 // frame's slots, then the bank.
-function seg_take(seg: Seg): string[] {
+export function seg_take(seg: Seg): string[] {
   const { pop, at } = seg.frame ?? { pop: 0, at: [] };
   return [...pop > 0 ? [`WL_POPN(${pop});`] : [], ...seg.params.map((p, i) =>
     `${lay_c(seg.ks[i])} ${p} = ${i < at.length ? `STK(${at[i]})`
@@ -2826,7 +2826,15 @@ function compile_segs(fl: File): string {
   }).join("\n\n");
 }
 
-export function compile_book(book: Bend.Book): string {
+export type CarbOutput = {
+  fl: File;
+  defs: string[];
+  entries: Seg[];
+  desc: string[];
+  fills: [string, string[]][];
+};
+
+export function compile_carb(book: Bend.Book): CarbOutput {
   const show = show_main(book);
   const cb = carb_book(book, ["main", ...RUNTIME_ADTS]);
   const facts = () => JSON.stringify([[...cb.own], [...cb.hot],
@@ -2894,6 +2902,11 @@ export function compile_book(book: Bend.Book): string {
     die("an unbound name in the emitted C");
   }
   fills[0][1].push(...desc);
+  return { fl, defs, entries, desc, fills };
+}
+
+export function compile_book(book: Bend.Book): string {
+  const { fills } = compile_carb(book);
   return fills.reduce((src, [mark, parts]) => src.replace(
     new RegExp("^// " + mark + "\\n// " + "=".repeat(mark.length) + "$", "m"),
     (m) => [m, ...parts].join("\n\n")), TEMPLATE);
@@ -4289,7 +4302,11 @@ static u32 root_take(Corpus H, THR Term* v) {
 #undef  WL_AGAIN
 #define WL_SPIN
 #define WL_SPUN
+#ifdef __clang__
 #define WL_AGAIN(F) __attribute__((musttail)) return WL_##F(WL_ALL)
+#else
+#define WL_AGAIN(F) return WL_##F(WL_ALL)
+#endif
 
 typedef Reply (PRESERVE(preserve_none) *WlFn)(WL_SIG);
 #define WL_X(F) WL_FN WL_##F(WL_SIG);
@@ -4857,11 +4874,11 @@ static void gpu_note(const char* path) {
     " stale)\n", path);
 }
 
-#if !BEND_CUDA
+#if !BEND_CUDA && !BEND_VULKAN
 #define gpu_map pool_mmap
 #endif
 
-#if BEND_METAL || BEND_CUDA
+#if BEND_METAL || BEND_CUDA || BEND_VULKAN
 
 static void gpu_kernel(u32 pass, u32 groups);
 
@@ -5111,6 +5128,10 @@ static void gpu_pass(u32 f) {
   }
 }
 
+#elif BEND_VULKAN
+
+#include "bend2/vulkan/vulkan_rt.c"
+
 #else
 
 #define gpu_probe() false
@@ -5184,6 +5205,10 @@ static Corpus corpus_setup(bool gpu, long threads, u64 bytes) {
   if (gpu) {
     cuMemsetD8((CUdeviceptr)(uintptr_t)H, 0, STAK_OFF * 8);
     cuCtxSynchronize();
+  }
+#elif BEND_VULKAN
+  if (gpu) {
+    memset(H, 0, STAK_OFF * 8);
   }
 #endif
   memcpy(H + STAT_OFF, STAT_IMG, STAT_LEN * sizeof(u64));

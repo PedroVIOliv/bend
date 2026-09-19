@@ -22,6 +22,7 @@ import type { BunPlugin } from "bun";
 
 import * as Bend from "./bend.ts";
 import * as Comp from "./comp.ts";
+import { generateVulkanShader } from "./vulkan/codegen.ts";
 
 // Main
 // ====
@@ -292,7 +293,7 @@ function cli_emit(book: Bend.Book, out: string): void {
     const c   = path.join(dir, path.basename(out) + ".c");
     fs.writeFileSync(c, Comp.compile_book(book));
     try {
-      cli_build(out, c);
+      cli_build(out, c, book);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -356,26 +357,45 @@ function cc_find(gpu: boolean): string {
 // nix lays them, lib; else the ! runs on the cores). On macOS a program with
 // a framework (#import: a window, audio) builds as Objective-C; on Linux it
 // links the X11 and ALSA libraries it includes.
-function cli_build(bin: string, file: string): void {
+function cli_build(bin: string, file: string, book?: Bend.Book): void {
   const c     = fs.readFileSync(file, "utf8");
   const mac   = process.platform === "darwin";
   const win   = process.platform === "win32";
   const cuda  = process.env.CUDA_HOME || "/usr/local/cuda";
+  const hasCuda = fs.existsSync(cuda + "/include/nvrtc.h");
+  const vk    = !mac && !hasCuda;
   const bangs = !/^#define BANGS\s+0$/m.test(c)
-    && (mac || fs.existsSync(cuda + "/include/nvrtc.h"));
+    && (mac || hasCuda || vk);
   const cc    = cc_find(bangs);
   const objc  = mac && (bangs || /^#import /m.test(c))
     ? ["-x", "objective-c", "-fobjc-arc", "-fmodules"] : [];
   const libs  = win ? ["-lws2_32"] : [["X11", "X11"], ["alsa", "asound"]].flatMap(([h, l]) =>
     !mac && c.includes("#include <" + h + "/") ? ["-l" + l] : []);
   const outPath = win && !bin.endsWith(".exe") ? path.resolve(bin + ".exe") : path.resolve(bin);
+  const vkInc = ["-I" + path.dirname(Bend.BEND_DIR), "-I" + path.join(Bend.BEND_DIR, "vulkan")];
   const cpu = [...objc, "-std=c11", "-O3", file, "-lpthread", "-lm",
     ...libs, "-o", outPath];
   const gpu = mac ? ["-DBEND_METAL=1", ...cpu]
-    : ["-DBEND_CUDA=1", "-I" + cuda + "/include", "-L" + cuda + "/lib64",
-      "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
+    : hasCuda ? ["-DBEND_CUDA=1", "-I" + cuda + "/include", "-L" + cuda + "/lib64",
+      "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"]
+    : ["-DBEND_VULKAN=1", ...vkInc, ...cpu];
   const steps: [string, string[]][] = bangs
-    ? [[cc, gpu], [outPath, ["--gpu-build"]]] : [[cc, cpu]];
+    ? (vk ? [[cc, gpu]] : [[cc, gpu], [outPath, ["--gpu-build"]]]) : [[cc, cpu]];
+
+  if (bangs && vk) {
+    const compSrc = book ? generateVulkanShader(book) : generateVulkanShader(c);
+    const compFile = path.resolve(bin + ".comp");
+    const spvFile = path.resolve(bin + ".gpu");
+    fs.writeFileSync(compFile, compSrc);
+    const glslang = process.env.GLSLANG || "glslangValidator";
+    const res = child.spawnSync(glslang, ["-V", "--target-env", "vulkan1.3", "-o", spvFile, compFile], { stdio: "pipe" });
+    if (res.status !== 0) {
+      if (res.stdout) process.stdout.write(res.stdout);
+      if (res.stderr) process.stderr.write(res.stderr);
+      throw "Error: glslangValidator failed to compile " + compFile;
+    }
+  }
+
   for (const [cmd, args] of steps) {
     if (child.spawnSync(cmd, args, { stdio: "inherit" }).status !== 0) {
       throw "Error: " + path.basename(cmd) + " failed to build " + bin;

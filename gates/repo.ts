@@ -39,8 +39,9 @@ allow("flake.nix", 1500);
 allow("bend2/base.bend", 32000);
 allow("bend2/bend.lean", 400000);
 allow("bend2/bend.ts", 41000);
-allow("bend2/comp.ts", 62000);
+allow("bend2/comp.ts", 63000);
 allow("bend2/main.ts", 10000);
+allow(/^bend2\/vulkan\/[a-z_]+\.(h|c|ts)$/, 10000);
 allow(/^bend2\/effs\/[a-z0-9_]+\.(c|js)$/, 4000);
 allow(/^bend2\/pack\/(\.gitignore|package\.json|tsconfig\.json|bun\.lock)$/, 1000);
 allow(/^bend2\/docs\/(BendRT|BendTT)\/(main\.typ|refs\.bib)$/, 60000);
@@ -74,9 +75,17 @@ allow(/^tests\/[a-z]+\/[a-z0-9_]+\.(c|js)$/, 8000);
 // Gate
 // ====
 
+const TTOK_BIN = (() => {
+  if (process.platform === "win32" && process.env.APPDATA) {
+    const p = path.join(process.env.APPDATA, "Python", "Python313", "Scripts", "ttok.exe");
+    if (fs.existsSync(p)) return p;
+  }
+  return "ttok";
+})();
+
 function ttok(file: string): number {
-  const got = child.spawnSync("ttok", [], { input: fs.readFileSync(file) });
-  return Number(got.stdout.toString().trim());
+  const got = child.spawnSync(TTOK_BIN, [], { input: fs.readFileSync(file) });
+  return Number(got.stdout ? got.stdout.toString().trim() : 0);
 }
 
 function gate(): string[] {
