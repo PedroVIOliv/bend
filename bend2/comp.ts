@@ -5440,10 +5440,8 @@ OUTLINE Term corpus_eval(Corpus H, Term t) {
 #define IO_TIME 2
 #define IO_PARK TERM_HOLE
 
-// A handle is its host value, a descriptor or a pointer, packed in one
-// word (a pointer split over the aux and loc bits). Its type is a law of
-// base, opaque and linear: a program cannot forge, copy or reuse one, so
-// nothing stands between the value and the host.
+// Base's opaque, linear handles pack host fds/pointers into aux/loc:
+// no forging, copying, reuse or host wrapper.
 #define io_hand(v)   term_make(TAG_PAK, (u64)(v) >> 40, (u64)(v) & LOC_MASK)
 #define io_hand_v(t) (((u64)term_aux(t) << 40) | term_loc(t))
 
@@ -5505,12 +5503,11 @@ static int io_sys_addr(const char* host, u32 port, struct sockaddr_in* at) {
 }
 
 // The program's arguments (IO.args).
-static int    io_argc = 0;
-static char** io_argv = NULL;
+static int    io_argc;
+static char** io_argv;
 
 static void io_eff(u32 cid, Effect run, u32 need) {
-  IoEff row = { run, need };
-  io_eff_rows[cid] = row;
+  io_eff_rows[cid] = (IoEff){ run, need };
 }
 
 static u64 io_sys_end(IoWork* w, ssize_t n) {
@@ -5518,10 +5515,9 @@ static u64 io_sys_end(IoWork* w, ssize_t n) {
   return n < 0 ? 0 : (u64)n;
 }
 
-// A computation's activation for its whole life: cont over item is its
-// next request; parked, work.word and time are its fd and deadline, evts
-// what the fd must be ready for, and work.pack resumes it (io_exec runs
-// cont, the request); work leads, so an effect's IoWork* is its activation.
+// cont(item) is the next request (run by io_exec). Parked, word/time/evts
+// hold fd/deadline/readiness; pack resumes. Leading work permits IoWork*
+// to IoAct* casts.
 // IoAct ::=
 //   | IoAct(work, cont, item, time, evts, next)
 typedef struct IoAct {
@@ -5564,10 +5560,8 @@ static void io_spawn(Term m) {
   io_live += 1;
 }
 
-// Parks the effect's activation until fd is ready for evts (POLLIN or
-// POLLOUT; 0 for no fd), or until time (a tick; 0 for no deadline),
-// whichever comes first; the loop then calls more on its thread, whose
-// value readies the activation, or IO_PARK, a re-park.
+// Park until evts (POLLIN/POLLOUT; 0 ignores fd) or time (0: no deadline).
+// The loop calls more: a value resumes, IO_PARK re-parks.
 static Term io_wait_on(IoWork* w, int fd, short evts, u64 time, IoPack more) {
   IoAct* a     = (IoAct*)w;
   a->work.word = (u32)fd;
@@ -5578,7 +5572,7 @@ static Term io_wait_on(IoWork* w, int fd, short evts, u64 time, IoPack more) {
   return IO_PARK;
 }
 
-// the deadline a parked activation waits for (0 for none)
+// Parked deadline (0: none).
 static u64 io_wait_time(IoWork* w) {
   return ((IoAct*)w)->time;
 }
@@ -5740,8 +5734,7 @@ static void* io_help(void* arg) {
   }
 }
 
-// A helper takes the effect's activation: call on its thread, then pack
-// on the loop's, whose value readies the activation.
+// Run call on a helper thread, then pack on the loop to resume the effect.
 static Term io_work(IoWork* w, IoCall call, IoPack pack) {
   w->call  = call;
   w->pack  = pack;
@@ -5761,8 +5754,7 @@ static Term io_work(IoWork* w, IoCall call, IoPack pack) {
   return IO_PARK;
 }
 
-// Runs the request in cont: the effect takes its fields (the node goes)
-// and answers a value, which readies the activation, or IO_PARK, a moved.
+// Consume cont's request node; the effect returns a value or IO_PARK.
 static Term io_exec(Env e, IoWork* w) {
   IoAct* a = (IoAct*)w;
   Term   fs[256];
@@ -5807,8 +5799,7 @@ static void io_wait(Env e) {
   u64   now  = io_tick();
   u32   i    = 1;
   IoQue todo = io_park;
-  io_park.head = NULL;
-  io_park.last = NULL;
+  io_park = (IoQue){0};
   while (todo.head != NULL) {
     IoAct* a   = io_pop(&todo);
     bool   due = (a->evts != 0 && fds[i].revents != 0)
@@ -6404,9 +6395,8 @@ function io_sys() {
     const err = mac ? "__error" : "__errno_location";
     const T = { i: "i32", u: "u32", U: "u64", I: "i64", p: "ptr",
       c: "cstring" };
-    // fcntl is variadic. Apple arm64 passes variadic arguments on the
-    // stack, where the fixed convention puts arguments past the eighth, so
-    // there the flags ride as a ninth argument; elsewhere in a register.
+    // Apple arm64 stacks variadic fcntl flags: use the ninth fixed arg.
+    // Other targets use the third.
     const vari = mac && process.arch === "arm64";
     const lib = ffi.dlopen(mac ? "libSystem.dylib" : "libc.so.6",
       Object.fromEntries(("socket:iii>i bind:ipu>i listen:ii>i connect:ipu>i"
@@ -6417,19 +6407,19 @@ function io_sys() {
         + " strerror:i>c " + err + ":>p").split(" ").map((s) => {
         const [name, args, ret] = s.split(/[:>]/);
         return [name, { args: [...args].map((a) => T[a]), returns: T[ret] }];
-      })));
+      }))).symbols;
     const fcntl = (fd, cmd, arg) => vari
-      ? lib.symbols.fcntl(fd, cmd, 0, 0, 0, 0, 0, 0, arg)
-      : lib.symbols.fcntl(fd, cmd, arg);
-    globalThis.BEND_SYS = { ...lib.symbols, fcntl, ptr: ffi.ptr, mac,
-      errno: () => ffi.read.i32(lib.symbols[err](), 0) };
+      ? lib.fcntl(fd, cmd, 0, 0, 0, 0, 0, 0, arg)
+      : lib.fcntl(fd, cmd, arg);
+    globalThis.BEND_SYS = { ...lib, fcntl, ptr: ffi.ptr, mac,
+      errno: () => ffi.read.i32(lib[err](), 0) };
   }
   return globalThis.BEND_SYS;
 }
 
 function io_fail(code) {
-  const text = String(io_sys().strerror(code));
-  return { $: "Fail", error: io_tup(code >>> 0, text) };
+  return { $: "Fail",
+    error: io_tup(code >>> 0, String(io_sys().strerror(code))) };
 }
 
 function io_done(value) {
@@ -6437,7 +6427,7 @@ function io_done(value) {
 }
 
 function io_tup(...xs) {
-  return xs.reduceRight((snd, fst) => ({ $: "Tuple", fst: fst, snd: snd }));
+  return xs.reduceRight((snd, fst) => ({ $: "Tuple", fst, snd }));
 }
 
 function io_bytes(text) {
@@ -6445,8 +6435,7 @@ function io_bytes(text) {
 }
 
 function io_text(b, n) {
-  const dec = new TextDecoder("utf-8", { ignoreBOM: true });
-  return dec.decode(b.subarray(0, n));
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(b.subarray(0, n));
 }
 
 function io_addr(host, port) {
@@ -6463,7 +6452,7 @@ function io_addr(host, port) {
 
 function io_push(fun, arg, fresh) {
   const io = globalThis.BEND_IO;
-  io.runs.push({ fun: fun, arg: arg });
+  io.runs.push({ fun, arg });
   io.live += fresh ? 1 : 0;
 }
 
@@ -6486,17 +6475,16 @@ function io_wait(io) {
   }
 }
 
-// A park's wake: more's value goes to k, or undefined, a re-park.
+// Resume k with more's value; undefined means re-parked.
 function io_wake(w) {
   const x = w.more();
   return x === undefined ? undefined : w.k(x);
 }
 
-// Parks the running effect until fd is readable (out false) or writable,
-// or until at (a performance.now() tick; undefined for no deadline),
-// whichever comes first.
+// Park for read/write (out) or deadline at (performance.now()).
+// Undefined fd/at disables that source.
 function io_park_on(fd, out, k, more, at) {
-  globalThis.BEND_IO.waits.push({ fd: fd, out: out, k: k, more: more, at: at });
+  globalThis.BEND_IO.waits.push({ fd, out, k, more, at });
 }
 
 function io_run(m) {
@@ -6518,10 +6506,7 @@ function io_run(m) {
       }
       const s = io.runs.shift();
       let op = s.fun(s.arg);
-      for (;;) {
-        if (op === undefined) {
-          break;
-        }
+      while (op !== undefined) {
         if (op.$ === "Emit") {
           io.live -= 1;
           break;
@@ -6531,12 +6516,10 @@ function io_run(m) {
           return op.code;
         }
         const need = op.need?.() ?? {};
-        const fd = need.read ? op.args[0] : null;
-        if (need.time || fd !== null) {
+        if (need.time || need.read) {
           const more = () => op.run(...op.args, op.kont);
-          io.waits.push(fd === null
-            ? { at: performance.now() + Number(op.args[0]), k: op.kont, more }
-            : { fd: fd, k: op.kont, more });
+          io_park_on(need.read ? op.args[0] : undefined, false, op.kont, more,
+            need.read ? undefined : performance.now() + Number(op.args[0]));
           break;
         }
         const x = op.run(...op.args, op.kont);
