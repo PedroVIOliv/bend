@@ -3362,7 +3362,9 @@ const TEMPLATE = String.raw`
 #include <metal_stdlib>
 using namespace metal;
 #elif !defined(__CUDACC_RTC__)
-#ifndef __APPLE__
+#ifdef __APPLE__
+#define _DARWIN_UNLIMITED_SELECT
+#else
 #define _GNU_SOURCE
 #endif
 #include <stdint.h>
@@ -3379,6 +3381,7 @@ using namespace metal;
 #include <sys/mman.h>
 #include <time.h>
 #include <poll.h>
+#include <sys/select.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -5765,46 +5768,55 @@ static Term io_exec(Env e, IoWork* w) {
   return io_eff_rows[c].run(e, fs, w);
 }
 
+// macOS poll misses FIFO EOF. Size select sets to the highest fd;
+// _DARWIN_UNLIMITED_SELECT allows fds past FD_SETSIZE.
+static bool io_bit(u8* set, int fd, bool put) {
+  u8* at = set + fd / 8;
+  *at |= put << fd % 8;
+  return *at >> fd % 8 & 1;
+}
+
 static void io_wait(Env e) {
-  struct pollfd* fds = io_mem(malloc((io_live + 1) * sizeof *fds));
-  u32 n    = 1;
+  int top  = io_wake_fd[0];
   u64 soon = 0;
-  int ms   = -1;
-  fds[0].fd     = io_wake_fd[0];
-  fds[0].events = POLLIN;
   for (IoAct* a = io_park.head; a != NULL; a = a->next) {
-    if (a->time != 0) {
-      soon = soon == 0 || a->time < soon ? a->time : soon;
+    if (a->time != 0 && (soon == 0 || a->time < soon)) {
+      soon = a->time;
     }
+    if (a->evts != 0 && (int)a->work.word > top) {
+      top = (int)a->work.word;
+    }
+  }
+  u64 len = (u64)top / 64 * 8 + 8;
+  u8* set[2] = { io_mem(calloc(2, len)), NULL };
+  set[1] = set[0] + len;
+  io_bit(set[0], io_wake_fd[0], true);
+  for (IoAct* a = io_park.head; a != NULL; a = a->next) {
     if (a->evts != 0) {
-      fds[n].fd     = (int)a->work.word;
-      fds[n].events = a->evts;
-      n += 1;
+      io_bit(set[a->evts == POLLOUT], (int)a->work.word, true);
     }
   }
-  if (soon != 0) {
-    u64 now = io_tick();
-    u64 gap = soon > now ? (soon - now) / 1000000 + 1 : 0;
-    ms = gap > 0x7fffffff ? 0x7fffffff : (int)gap;
-  }
+  u64 tick = io_tick();
+  u64 ms = soon > tick ? (soon - tick) / 1000000 + 1 : 0;
+  struct timeval tv = { ms / 1000, ms % 1000 * 1000 };
   io_sync();
-  while (poll(fds, n, ms) < 0) {
+  while (select(top + 1, (fd_set*)set[0], (fd_set*)set[1], NULL,
+    soon == 0 ? NULL : &tv) < 0) {
     if (errno != EINTR) {
       err_fail("the poller failed");
     }
   }
-  if (fds[0].revents != 0) {
+  if (io_bit(set[0], io_wake_fd[0], false)) {
     io_take(e);
   }
   u64   now  = io_tick();
-  u32   i    = 1;
   IoQue todo = io_park;
   io_park = (IoQue){0};
   while (todo.head != NULL) {
     IoAct* a   = io_pop(&todo);
-    bool   due = (a->evts != 0 && fds[i].revents != 0)
+    bool   due = (a->evts != 0
+        && io_bit(set[a->evts == POLLOUT], (int)a->work.word, false))
       || (a->time != 0 && a->time <= now);
-    i += a->evts != 0;
     if (!due) {
       io_push(&io_park, a);
       continue;
@@ -5815,7 +5827,7 @@ static void io_wait(Env e) {
       io_push(&io_runs, a);
     }
   }
-  free(fds);
+  free(set[0]);
 }
 
 ${NATIVE.IO}
@@ -6393,6 +6405,8 @@ function io_sys() {
     const ffi = require("bun:ffi");
     const mac = process.platform === "darwin";
     const err = mac ? "__error" : "__errno_location";
+    // Darwin's extended select supports high fds.
+    const sel = mac ? "select$DARWIN_EXTSN" : "select";
     const T = { i: "i32", u: "u32", U: "u64", I: "i64", p: "ptr",
       c: "cstring" };
     // Apple arm64 stacks variadic fcntl flags: use the ninth fixed arg.
@@ -6401,8 +6415,8 @@ function io_sys() {
     const lib = ffi.dlopen(mac ? "libSystem.dylib" : "libc.so.6",
       Object.fromEntries(("socket:iii>i bind:ipu>i listen:ii>i connect:ipu>i"
         + " accept:ipp>i send:ipUi>I recv:ipUi>I read:ipU>I pread:ipUI>I"
-        + " sendto:ipUipu>I"
-        + " recvfrom:ipUipp>I close:i>i poll:pui>i setsockopt:iiipu>i"
+        + " sendto:ipUipu>I recvfrom:ipUipp>I close:i>i setsockopt:iiipu>i"
+        + " " + sel + ":ipppp>i"
         + (vari ? " fcntl:iiiiiiiii>i" : " fcntl:iii>i") + " getsockopt:iiipp>i"
         + " strerror:i>c " + err + ":>p").split(" ").map((s) => {
         const [name, args, ret] = s.split(/[:>]/);
@@ -6411,7 +6425,8 @@ function io_sys() {
     const fcntl = (fd, cmd, arg) => vari
       ? lib.fcntl(fd, cmd, 0, 0, 0, 0, 0, 0, arg)
       : lib.fcntl(fd, cmd, arg);
-    globalThis.BEND_SYS = { ...lib, fcntl, ptr: ffi.ptr, mac,
+    globalThis.BEND_SYS = { ...lib, fcntl, select: lib[sel],
+      ptr: ffi.ptr, mac,
       errno: () => ffi.read.i32(lib[err](), 0) };
   }
   return globalThis.BEND_SYS;
@@ -6458,21 +6473,30 @@ function io_push(fun, arg, fresh) {
 
 function io_wait(io) {
   const soon = io.waits.reduce((m, w) => Math.min(m, w.at ?? m), Infinity);
-  let ms = -1;
-  if (soon !== Infinity) {
-    ms = Math.ceil(soon - performance.now());
-    ms = Math.min(Math.max(0, ms), 2147483647);
-  }
+  const ms = soon === Infinity ? -1
+    : Math.max(0, Math.ceil(soon - performance.now()));
   const fds = io.waits.filter((w) => w.fd !== undefined);
-  const buf = Int32Array.from(fds.flatMap((w) => [w.fd, w.out ? 4 : 1]));
-  io_sys().poll(fds.length > 0 ? io_sys().ptr(buf) : null, fds.length, ms);
-  const now = performance.now();
-  const fire = io.waits.filter((w) =>
-    (buf[2 * fds.indexOf(w) + 1] >>> 16) !== 0 || w.at <= now);
-  io.waits = io.waits.filter((w) => !fire.includes(w));
-  for (const w of fire) {
-    io_push(io_wake, w, false);
+  const top = fds.reduce((m, w) => Math.max(m, w.fd), 0);
+  const len = (top >> 6 << 3) + 8;
+  const set = new Uint8Array(2 * len);
+  const at = (w) => (w.out ? len : 0) + (w.fd >> 3);
+  for (const w of fds) {
+    set[at(w)] |= 1 << (w.fd & 7);
   }
+  const tv = new BigInt64Array([BigInt(ms / 1000 | 0),
+    BigInt(ms % 1000 * 1000)]);
+  const sys = io_sys();
+  sys.select(top + 1, sys.ptr(set), sys.ptr(set, len), null,
+    ms < 0 ? null : sys.ptr(tv));
+  const now = performance.now();
+  io.waits = io.waits.filter((w) => {
+    const ready = w.at <= now || w.fd !== undefined
+      && set[at(w)] & 1 << (w.fd & 7);
+    if (ready) {
+      io_push(io_wake, w, false);
+    }
+    return !ready;
+  });
 }
 
 // Resume k with more's value; undefined means re-parked.
